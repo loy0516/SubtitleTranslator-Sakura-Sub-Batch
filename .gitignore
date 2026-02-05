@@ -1,0 +1,14 @@
+# 忽略模型文件
+models/*.gguf
+
+# 忽略输入输出文件夹
+input/*.ass
+output/*.ass
+
+# 忽略 Python 缓存
+__pycache__/
+*.pyc
+
+# 忽略虚拟环境
+venv/
+.venv/

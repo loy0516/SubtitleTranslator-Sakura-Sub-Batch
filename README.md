@@ -107,3 +107,9 @@
 - **模型来源**：[SakuraLLM (Qwen2.5-7B)](https://github.com/sakura-editor/sakura)
 - **HuggingFace(下载模型)**: [Sakura-7B-Qwen2.5-v1.0-GGUF](https://huggingface.co/SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF/blob/main/sakura-7b-qwen2.5-v1.0-q6k.gguf)
 - **底层支持**：[llama-cpp-python](https://github.com/abetlen/llama-cpp-python)与[pysubs2](https://github.com/tkarabela/pysubs2)
+
+---
+
+## 🤝 特别鸣谢
+- **Google Gemini**：
+- 提供了核心清洗逻辑的架构建议与正则优化方案。特别是在处理 ASS 样式占位符（Tag Protection）与解决本地模型 Token 溢出幻觉方面提供了关键的技术支持。

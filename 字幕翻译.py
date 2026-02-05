@@ -65,8 +65,9 @@ def batch_translate():
                     clean_zh = re.sub(r'^\d+[\.、\s]*', '', results[res_idx]).strip()
                     # 2. 深度清理：去掉 AI 脑补出来的重复前缀括号
                     clean_zh = re.sub(r'^[\(\)（）「」『』\s]+', '', clean_zh)
-                    # 3. 抹除末尾标点
-                    clean_zh = re.sub(r'[，。！？,.\?!]+$', '', clean_zh).strip()
+                    # 3. 抹除全句所有的标点符号（包括句子中间的）
+                    # 这里使用了字符集匹配，去掉了常见的中英文标点
+                    clean_zh = re.sub(r'[，。！？、,.\?!\s]+', '', clean_zh).strip()
 
                     # 组装：保留原句特效标签作为第一行，干净的中文作为第二行
                     # final_zh 使用原有的 prefix/suffix，确保符号不重复
@@ -84,4 +85,5 @@ def batch_translate():
 
 
 if __name__ == "__main__":
+
     batch_translate()

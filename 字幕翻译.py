@@ -1,89 +1,200 @@
-import re
 import time
 import pysubs2
+import threading
+import sys
+import re
+import os
 from llama_cpp import Llama
+from concurrent.futures import ThreadPoolExecutor
 
 # --- 配置 ---
 MODEL_PATH = r"E:\Downloads\sakura-7b-qwen2.5-v1.0-q6k.gguf"
-INPUT_ASS = r"E:\Downloads\[NanakoRaws] Champignon no Majo - 05 (TBS 1920x1080 x265 AAC).ass"
-OUTPUT_ASS = r"E:\Downloads\output_sakura_batch.ass"
-BATCH_SIZE = 10
+INPUT_PATH = r"E:\Downloads\INPUT_ass.ass"  # 支持 .srt 或 .ass
+OUTPUT_PATH = r"E:\Downloads\output_fixedass.ass"
+
+MAX_WORKERS = 2
+BATCH_SIZE = 8  # ASS 专用的批处理大小
+model_lock = threading.Lock()
+progress_lock = threading.Lock()
+completed_lines = 0
+total_lines = 0
+
+print(f"🚀 启动 SakuraLLM：双模自适应引擎...")
+# 为了兼容批处理，n_ctx 稍微调大
+llm = Llama(model_path=MODEL_PATH, n_gpu_layers=-1, n_ctx=2048, verbose=False)
 
 
-def batch_translate():
-    print("🚀 正在启动 SakuraLLM 批量翻译引擎 (GPU 加速版)...")
-    # 保持 n_ctx=1024 确保 3060 Ti 运行稳健
-    llm = Llama(model_path=MODEL_PATH, n_gpu_layers=-1, n_ctx=1024, verbose=False)
+# --- 通用工具函数 ---
 
-    subs = pysubs2.load(INPUT_ASS)
-    total = len(subs)
+def split_prefix_properly(text):
+    """提取行首名字括号/特殊符号前缀"""
+    # 增强正则：匹配行首的标签、符号、横杠或括号名
+    pattern = r'^((?:\{.*?\}|[-－\s]*[（\(].*?[）\)]+[\s]*|[^\w\u4e00-\u9fa5\u3041-\u30ff]+)+)'
+    match = re.match(pattern, text)
+    if match:
+        prefix = match.group(1)
+        body = text[len(prefix):].strip()
+        return prefix, body
+    return "", text
 
-    # 预处理：剔除 ASS 特效标签，只提取纯净的待翻译文本
-    processed_lines = []
+
+def clean_mid_text_furigana(text):
+    """清理文中注音，防止 AI 截断或复读"""
+    return re.sub(r'([\u4e00-\u9fa5])[\(（][\u3040-\u30ff]+[\)）]', r'\1', text)
+
+
+def update_progress(increment=1):
+    global completed_lines
+    with progress_lock:
+        completed_lines += increment
+        percent = (completed_lines / total_lines) * 100
+        sys.stdout.write(f"\r📈 进度: {percent:.1f}% ({completed_lines}/{total_lines})")
+        sys.stdout.flush()
+
+
+# --- 方案 A: SRT 逻辑 (并发单行) ---
+
+def translate_line_srt(idx, all_tasks):
+    line_obj, original_text = all_tasks[idx]
+    prefix, pure_body = split_prefix_properly(original_text)
+    clean_body = clean_mid_text_furigana(pure_body)
+
+    if not clean_body.strip():
+        line_obj.text = f"{line_obj.text}\\N{prefix}"
+        return update_progress()
+
+    prompt = f"<|im_start|>system\n你是一个日漫翻译，请将日文翻译成流利的中文台词。直接输出译文。<|im_end|>\n<|im_start|>user\n{clean_body}<|im_end|>\n<|im_start|>assistant\n"
+
+    try:
+        with model_lock:
+            output = llm(prompt, max_tokens=150, stop=["<|im_end|>", "\n"], temperature=0.1, repeat_penalty=1.2)
+        res = output["choices"][0]["text"].strip()
+        res = re.sub(r'^[（\(].*?[）\)]|翻译[:：]|「|」', '', res).strip()
+
+        if res:
+            final_zh = f"{prefix}{res}".replace("[BR]", "\\N")
+            line_obj.text = f"{line_obj.text}\\N{final_zh}"
+        else:
+            line_obj.text = f"{line_obj.text}\\N{prefix}{clean_body}"
+        update_progress()
+    except:
+        update_progress()
+
+
+# --- 方案 B: ASS 逻辑 (批处理保护) ---
+
+def protect_ass_tags(text):
+    """提取标签占位符，并增强行尾符号保护"""
+    # prefix, body = split_prefix_properly(text) # 旧代码
+
+    # 新增逻辑：提取前缀的同时，提取行尾衔接符 (➡, 》, ≫, ...)
+    prefix, rem_text = split_prefix_properly(text)
+    suffix_pattern = r'([➡≫》>]+)$'
+    suffix_match = re.search(suffix_pattern, rem_text)
+    suffix = suffix_match.group(1) if suffix_match else ""
+    body = rem_text[:-len(suffix)] if suffix else rem_text
+
+    tags = re.findall(r'\{.*?\}', body)
+    masked_body = body
+    for i, tag in enumerate(tags):
+        masked_body = masked_body.replace(tag, f" [T{i}] ", 1)
+
+    # 同样清理注音
+    masked_body = clean_mid_text_furigana(masked_body)
+    return prefix, masked_body, tags, suffix
+
+
+def translate_batch_ass(batch_tasks):
+    prompt_lines = []
+    for idx, task in enumerate(batch_tasks):
+        # 增加判断：如果 masked_body 不包含任何汉字/假名（纯符号行），则标记为不需要翻译
+        if not re.search(r'[\u3040-\u30ff\u4e00-\u9fa5]', task['masked_body']):
+            prompt_lines.append(f"{idx + 1}: SKIP_LINE")
+        else:
+            prompt_lines.append(f"{idx + 1}: {task['masked_body']}")
+
+    combined_input = "\n".join(prompt_lines)
+
+    prompt = f"<|im_start|>system\n你是一个日漫翻译专家。请按编号翻译台词，保持[T_n]占位符位置不变。如果看到 SKIP_LINE 则原样输出。<|im_end|>\n<|im_start|>user\n{combined_input}<|im_end|>\n<|im_start|>assistant\n1: "
+
+    with model_lock:
+        output = llm(prompt, max_tokens=1024, temperature=0.1, stop=["<|im_end|>", "User:"])
+
+    raw_res = "1: " + output["choices"][0]["text"]
+    results = {}
+    for i in range(len(batch_tasks)):
+        pattern = rf"{i + 1}[:：]\s*(.*?)(?=\n\d+[:：]|$)"
+        match = re.search(pattern, raw_res, re.DOTALL)
+        if match:
+            # 强化过滤：清理 ID 泄露和冗余词汇
+            content = match.group(1).strip()
+            content = re.sub(r'^\d+[:：]\s*', '', content)
+            results[i] = re.sub(r'占位符|翻译|保持|「|」|SKIP_LINE', '', content).strip()
+    return results
+
+
+# --- 入口控制 ---
+
+def start():
+    global total_lines
+    ext = os.path.splitext(INPUT_PATH)[1].lower()
+    subs = pysubs2.load(INPUT_PATH)
+
+    all_tasks = []
     for line in subs:
-        # 使用 pysubs2 的工具剥离所有 {\...} 标签
-        # 这样 (ドロシー) 前面的特效标签就不会干扰正则了
-        pure_text = line.plaintext.strip()
+        p = line.plaintext.strip()
+        if p:
+            p = p.replace("\\N", "[BR]").replace("\n", "[BR]")
+            all_tasks.append((line, p))
 
-        if not pure_text:
-            processed_lines.append(None)
-            continue
-
-        # 剥离前后符号：比如把 “（ドロシー）” 拆成 “（”, “ドロシー”, “）”
-        SYMBOL_RE = re.compile(r"^([^\w\u4e00-\u9fa5\u3040-\u30ff]*)[\s]*(.*?)[\s]*([^\w\u4e00-\u9fa5\u3040-\u30ff]*)$")
-        match = SYMBOL_RE.match(pure_text)
-
-        prefix, main, suffix = match.groups() if match else ("", pure_text, "")
-        processed_lines.append({
-            "prefix": prefix,
-            "main": main,
-            "suffix": suffix,
-            "orig_raw": line.text  # 保留带标签的原句
-        })
-
+    total_lines = len(all_tasks)
     time_s = time.time()
 
-    for i in range(0, total, BATCH_SIZE):
-        batch = processed_lines[i: i + BATCH_SIZE]
-        to_translate = [b["main"] for b in batch if b is not None and len(b["main"]) > 0]
+    if ext == ".ass":
+        print(f"🎬 检测到 ASS 格式，启动【批处理保护】方案 (Batch Size: {BATCH_SIZE})...")
+        # 准备批处理数据
+        ass_tasks = []
+        for line_obj, text in all_tasks:
+            # prefix, masked_body, tags = protect_ass_tags(text) # 旧代码
+            prefix, masked_body, tags, suffix = protect_ass_tags(text)  # 新逻辑增加 suffix
+            ass_tasks.append({
+                'obj': line_obj,
+                'masked_body': masked_body,
+                'prefix': prefix,
+                'tags': tags,
+                'suffix': suffix  # 记录行尾衔接符
+            })
 
-        if not to_translate:
-            continue
+        for i in range(0, total_lines, BATCH_SIZE):
+            batch = ass_tasks[i: i + BATCH_SIZE]
+            batch_results = translate_batch_ass(batch)
+            for idx, task in enumerate(batch):
+                res = batch_results.get(idx, "")
+                if res:
+                    for t_idx, tag in enumerate(task['tags']):
+                        res = res.replace(f"[T{t_idx}]", tag).replace(f"T{t_idx}", tag)
 
-        prompt_text = "\n".join([f"{idx + 1}. {text}" for idx, text in enumerate(to_translate)])
-        prompt = f"<|im_start|>system\n你是一个动漫专家，请将日文台词翻译成流利的中文。按序号对应，不要多言，不要任何标点符号。<|im_end|>\n<|im_start|>user\n{prompt_text}<|im_end|>\n<|im_start|>assistant\n"
+                    # final_zh = f"{task['prefix']}{res}".replace(" ", "").replace("[BR]", "\\N") # 旧代码
 
-        output = llm(prompt, max_tokens=512, stop=["<|im_end|>"], echo=False)
-        results = output["choices"][0]["text"].strip().split('\n')
+                    # 缝合逻辑优化：去重前缀括号并粘合行尾衔接符
+                    res = re.sub(r'([《（(])\1+', r'\1', res)  # 符号去重
+                    final_zh = f"{task['prefix']}{res}{task['suffix']}"
+                    final_zh = final_zh.replace(" ", "").replace("[BR]", "\\N")
 
-        res_idx = 0
-        for j in range(len(batch)):
-            current_item = batch[j]
-            if current_item and len(current_item["main"]) > 0:
-                if res_idx < len(results):
-                    # 1. 基础清理：去掉序号
-                    clean_zh = re.sub(r'^\d+[\.、\s]*', '', results[res_idx]).strip()
-                    # 2. 深度清理：去掉 AI 脑补出来的重复前缀括号
-                    clean_zh = re.sub(r'^[\(\)（）「」『』\s]+', '', clean_zh)
-                    # 3. 抹除全句所有的标点符号（包括句子中间的）
-                    # 这里使用了字符集匹配，去掉了常见的中英文标点
-                    clean_zh = re.sub(r'[，。！？、,.\?!\s]+', '', clean_zh).strip()
+                    task['obj'].text = f"{task['obj'].text}\\N{final_zh}"
+                else:
+                    task['obj'].text = f"{task['obj'].text}\\N{task['prefix']}{task['masked_body']}{task['suffix']}"
+            update_progress(len(batch))
 
-                    # 组装：保留原句特效标签作为第一行，干净的中文作为第二行
-                    # final_zh 使用原有的 prefix/suffix，确保符号不重复
-                    final_zh = f"{current_item['prefix']}{clean_zh}{current_item['suffix']}"
-                    subs[i + j].text = f"{current_item['orig_raw']}\\N{final_zh}"
-                    res_idx += 1
-            elif current_item:
-                subs[i + j].text = f"{current_item['orig_raw']}\\N{current_item['orig_raw']}"
+    else:
+        print(f"📝 检测到 SRT 格式，启动【并发单行】方案 (Workers: {MAX_WORKERS})...")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            list(executor.map(lambda i: translate_line_srt(i, all_tasks), range(total_lines)))
 
-        print(f"📈 进度: {min(i + BATCH_SIZE, total)}/{total}")
-
-    subs.save(OUTPUT_ASS)
+    subs.save(OUTPUT_PATH)
     time_elapsed = time.time() - time_s
-    print(f"✨ 翻译完成！用时：{round(time_elapsed, 2)}s")
+    print(f"\n✨ 处理完成！输出文件：{OUTPUT_PATH} 用时：{time_elapsed}s")
 
 
 if __name__ == "__main__":
-
-    batch_translate()
+    start()

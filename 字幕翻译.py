@@ -9,8 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 # --- 配置 ---
 MODEL_PATH = r"E:\Downloads\sakura-7b-qwen2.5-v1.0-q6k.gguf"
-INPUT_PATH = r"E:\Downloads\INPUT_ass.ass"  # 支持 .srt 或 .ass
-OUTPUT_PATH = r"E:\Downloads\output_fixedass.ass"
+INPUT_PATH = r"E:\Downloads\output_fixed.srt"  # 支持 .srt 或 .ass
+OUTPUT_PATH = r"E:\Downloads\output_fixed.srt"
 
 MAX_WORKERS = 2
 BATCH_SIZE = 8  # ASS 专用的批处理大小
@@ -29,7 +29,7 @@ llm = Llama(model_path=MODEL_PATH, n_gpu_layers=-1, n_ctx=2048, verbose=False)
 def split_prefix_properly(text):
     """提取行首名字括号/特殊符号前缀"""
     # 增强正则：匹配行首的标签、符号、横杠或括号名
-    pattern = r'^((?:\{.*?\}|[-－\s]*[（\(].*?[）\)]+[\s]*|[^\w\u4e00-\u9fa5\u3041-\u30ff]+)+)'
+    pattern = r'^((?:\{.*?\}|[-－\s]*[（\(].*?[）\)]+[\s]*|[-－]+|[^\w\u4e00-\u9fa5\u3041-\u30ff]+)+)'
     match = re.match(pattern, text)
     if match:
         prefix = match.group(1)
@@ -125,13 +125,19 @@ def translate_batch_ass(batch_tasks):
     for i in range(len(batch_tasks)):
         pattern = rf"{i + 1}[:：]\s*(.*?)(?=\n\d+[:：]|$)"
         match = re.search(pattern, raw_res, re.DOTALL)
-        if match:
-            # 强化过滤：清理 ID 泄露和冗余词汇
-            content = match.group(1).strip()
-            content = re.sub(r'^\d+[:：]\s*', '', content)
-            results[i] = re.sub(r'占位符|翻译|保持|「|」|SKIP_LINE', '', content).strip()
-    return results
 
+        if match:
+            content = match.group(1).strip()
+            # 移除所有可能的编号前缀 (1:, 1. 等)
+            content = re.sub(r'^\d+[:：.]\s*', '', content)
+            # 物理清理所有占位符碎片
+            content = re.sub(r'\[?T\d+\]?|\[T|T\]', '', content)
+            # 移除 AI 引导语
+            content = re.sub(r'翻译结果|译文|「|」|SKIP_LINE', '', content).strip()
+            # 彻底去掉开头可能残余的孤立 [ 或 -
+            content = content.lstrip('[ -').rstrip('] ')
+            results[i] = content
+    return results
 
 # --- 入口控制 ---
 
@@ -168,22 +174,28 @@ def start():
         for i in range(0, total_lines, BATCH_SIZE):
             batch = ass_tasks[i: i + BATCH_SIZE]
             batch_results = translate_batch_ass(batch)
+            # --- 方案 B: ASS/SRT 统一回填处理 ---
             for idx, task in enumerate(batch):
                 res = batch_results.get(idx, "")
+
+                # 1. 获取最原始的日文 (防止重复运行脚本导致 text 越来越长)
+                # pysubs2 的 line.text 包含所有内容，我们要先恢复到只有日文状态
+                original_jp = task['obj'].plaintext.split('\\N')[0].strip()
+
                 if res:
                     for t_idx, tag in enumerate(task['tags']):
                         res = res.replace(f"[T{t_idx}]", tag).replace(f"T{t_idx}", tag)
 
-                    # final_zh = f"{task['prefix']}{res}".replace(" ", "").replace("[BR]", "\\N") # 旧代码
-
-                    # 缝合逻辑优化：去重前缀括号并粘合行尾衔接符
                     res = re.sub(r'([《（(])\1+', r'\1', res)  # 符号去重
                     final_zh = f"{task['prefix']}{res}{task['suffix']}"
                     final_zh = final_zh.replace(" ", "").replace("[BR]", "\\N")
 
-                    task['obj'].text = f"{task['obj'].text}\\N{final_zh}"
+                    # 关键修改：直接重写 text，而不是用 f"{task['obj'].text}\\N..."
+                    # 格式：日文原文\N中文译文
+                    task['obj'].text = f"{original_jp}\\N{final_zh}"
                 else:
-                    task['obj'].text = f"{task['obj'].text}\\N{task['prefix']}{task['masked_body']}{task['suffix']}"
+                    # 翻译失败则保持只有日文
+                    task['obj'].text = original_jp
             update_progress(len(batch))
 
     else:
